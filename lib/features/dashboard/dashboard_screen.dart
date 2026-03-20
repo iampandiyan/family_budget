@@ -3,6 +3,7 @@ import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 import 'package:intl/intl.dart';
 import 'package:fl_chart/fl_chart.dart';
+import '../../core/database/database_helper.dart';
 import '../expenses/expense_provider.dart';
 import '../budget/budget_provider.dart';
 
@@ -21,13 +22,26 @@ class _DashboardScreenState extends State<DashboardScreen> {
   DateTime? _part1EndDate;
 
   // --- PART 2 STATE ---
-  String _part2CompareBy = 'Category'; // 'Category', 'Subcategory', 'Payment Source'
+  String _part2CompareBy = 'Category'; // 'Amount', 'Category', 'Subcategory', 'Payment Source'
   int? _part2SelectedFilterId;
+  String _part2AmountFilter = 'All'; // Used when _part2CompareBy == 'Amount'
+
+  // DB Data
+  List<Map<String, dynamic>> _budgetItems = [];
 
   @override
   void initState() {
     super.initState();
-    Future.microtask(() {
+    Future.microtask(() async {
+      // Fetch budget items to get correct allocations for Part 2
+      final db = await DatabaseHelper.instance.database;
+      final bItems = await db.query('Budget_Items');
+      if (mounted) {
+        setState(() {
+          _budgetItems = bItems;
+        });
+      }
+
       Provider.of<BudgetProvider>(context, listen: false).loadData();
       Provider.of<ExpenseProvider>(context, listen: false).refreshData().then((_) {
         if (mounted) {
@@ -147,7 +161,6 @@ class _DashboardScreenState extends State<DashboardScreen> {
                   ),
                 ),
                 const SizedBox(width: 16),
-                // FIX: Prevents layout overflow completely
                 Expanded(
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
@@ -210,8 +223,11 @@ class _DashboardScreenState extends State<DashboardScreen> {
       totalSpent += amt;
 
       String cat = exp['category_name'] ?? 'Unknown';
-      String sub = exp['subcategory_name'] ?? 'Other';
-      if (sub.isEmpty) sub = 'Other';
+
+      // FIX 1: Add Category name in bracket for Subcategory
+      String subRaw = exp['subcategory_name'] ?? '';
+      String sub = subRaw.isNotEmpty ? '$subRaw ($cat)' : 'Other ($cat)';
+
       String src = exp['payment_source_name'] ?? 'Cash';
 
       String day = 'Unknown';
@@ -320,19 +336,30 @@ class _DashboardScreenState extends State<DashboardScreen> {
 
   Widget _buildPart2(ExpenseProvider expProvider, BudgetProvider budProvider) {
     List<Map<String, dynamic>> filterOptions = [];
+
     if (_part2CompareBy == 'Category') {
       filterOptions = expProvider.categories;
-    } else if (_part2CompareBy == 'Subcategory') {
-      filterOptions = expProvider.dbSubcategories;
+    }
+    // FIX 2a: Subcategory dropdown shows Category name in bracket
+    else if (_part2CompareBy == 'Subcategory') {
+      filterOptions = expProvider.dbSubcategories.map((sub) {
+        var cat = expProvider.categories.firstWhere(
+                (c) => c['id'] == sub['category_id'],
+            orElse: () => {'name': 'Unknown'});
+        return {
+          'id': sub['id'],
+          'name': '${sub['name']} (${cat['name']})'
+        };
+      }).toList();
     } else if (_part2CompareBy == 'Payment Source') {
       filterOptions = expProvider.paymentSources;
     }
 
-    if (filterOptions.isNotEmpty && !filterOptions.any((o) => o['id'] == _part2SelectedFilterId)) {
+    if (_part2CompareBy != 'Amount' && filterOptions.isNotEmpty && !filterOptions.any((o) => o['id'] == _part2SelectedFilterId)) {
       _part2SelectedFilterId = filterOptions.first['id'] as int;
     }
 
-    List<Map<String, dynamic>> budgets = List.from(expProvider.budgets.reversed);
+    List<Map<String, dynamic>> budgets = List.from(budProvider.budgets.reversed);
     List<BarChartGroupData> barGroups = [];
     double maxY = 0;
 
@@ -343,43 +370,65 @@ class _DashboardScreenState extends State<DashboardScreen> {
       double allocated = 0;
       double spent = 0;
 
-      var budgetExpenses = expProvider.expenses.where((e) => e['budget_id'] == bId).toList();
-      for (var e in budgetExpenses) {
-        bool matches = false;
-        if (_part2CompareBy == 'Category' && e['category_id'] == _part2SelectedFilterId) matches = true;
-        if (_part2CompareBy == 'Subcategory' && e['subcategory_id'] == _part2SelectedFilterId) matches = true;
-        if (_part2CompareBy == 'Payment Source' && e['payment_source_id'] == _part2SelectedFilterId) matches = true;
+      // ---- AMOUNT FILTER LOGIC ----
+      if (_part2CompareBy == 'Amount') {
+        // FIX 2c & 2d: Uses 'total_budget_amount' based on DB schema
+        allocated = (b['total_budget_amount'] as num?)?.toDouble() ?? 0.0;
+        var budgetExpenses = expProvider.expenses.where((e) => e['budget_id'] == bId).toList();
+        spent = budgetExpenses.fold(0.0, (sum, e) => sum + ((e['amount'] as num?)?.toDouble() ?? 0.0));
+      }
+      // ---- ORIGINAL FILTER LOGIC ----
+      else {
+        var budgetExpenses = expProvider.expenses.where((e) => e['budget_id'] == bId).toList();
+        for (var e in budgetExpenses) {
+          bool matches = false;
+          if (_part2CompareBy == 'Category' && e['category_id'] == _part2SelectedFilterId) matches = true;
+          if (_part2CompareBy == 'Subcategory' && e['subcategory_id'] == _part2SelectedFilterId) matches = true;
+          if (_part2CompareBy == 'Payment Source' && e['payment_source_id'] == _part2SelectedFilterId) matches = true;
 
-        if (matches) spent += (e['amount'] as num?)?.toDouble() ?? 0.0;
+          if (matches) spent += (e['amount'] as num?)?.toDouble() ?? 0.0;
+        }
+
+        if (_part2CompareBy == 'Category') {
+          // FIX 2b: Get EXACT allocated amount from Budget_Items table
+          var item = _budgetItems.firstWhere(
+                  (bi) => bi['budget_id'] == bId && bi['category_id'] == _part2SelectedFilterId,
+              orElse: () => <String, dynamic>{}
+          );
+          allocated = (item['allocated_amount'] as num?)?.toDouble() ?? 0.0;
+        }
       }
 
-      if (_part2CompareBy == 'Category') {
-        // Safe allocation mock logic.
-        allocated = spent > 0 ? spent * 1.2 : 0;
-      }
+      // Calculate max Y
+      bool drawAlloc = _part2CompareBy != 'Amount' || _part2AmountFilter == 'All' || _part2AmountFilter == 'Budget Allocation';
+      bool drawSpent = _part2CompareBy != 'Amount' || _part2AmountFilter == 'All' || _part2AmountFilter == 'Spent Amount';
 
-      if (allocated > maxY) maxY = allocated;
-      if (spent > maxY) maxY = spent;
+      if (drawAlloc && allocated > maxY) maxY = allocated;
+      if (drawSpent && spent > maxY) maxY = spent;
 
-      // FIX FOR CRASH: Only add tooltip indicator index if the bar value > 0
       List<BarChartRodData> rods = [];
       List<int> showingTooltipSpots = [];
-      int rodIndex = 0;
 
-      if (_part2CompareBy == 'Category' || _part2CompareBy == 'Subcategory') {
-        // Add Bar 1 (Allocated)
-        rods.add(BarChartRodData(toY: allocated, color: Colors.blue, width: 10, borderRadius: BorderRadius.circular(2)));
-        if (allocated > 0) showingTooltipSpots.add(rodIndex);
-        rodIndex++;
+      if (_part2CompareBy == 'Category' || _part2CompareBy == 'Amount') {
+        // Bar Index 0: Allocated
+        if (drawAlloc) {
+          rods.add(BarChartRodData(toY: allocated, color: Colors.blue, width: 10, borderRadius: BorderRadius.circular(2)));
+          if (allocated > 0) showingTooltipSpots.add(0);
+        } else {
+          rods.add(BarChartRodData(toY: 0, color: Colors.transparent, width: 10)); // Transparent dummy
+        }
 
-        // Add Bar 2 (Spent)
-        rods.add(BarChartRodData(toY: spent, color: Colors.redAccent, width: 10, borderRadius: BorderRadius.circular(2)));
-        if (spent > 0) showingTooltipSpots.add(rodIndex);
-        rodIndex++;
+        // Bar Index 1: Spent
+        if (drawSpent) {
+          rods.add(BarChartRodData(toY: spent, color: Colors.redAccent, width: 10, borderRadius: BorderRadius.circular(2)));
+          if (spent > 0) showingTooltipSpots.add(1);
+        } else {
+          rods.add(BarChartRodData(toY: 0, color: Colors.transparent, width: 10)); // Transparent dummy
+        }
       } else {
-        // Add Bar 1 (Payment Source Spent)
+        // Subcategories and Payment Sources do not have direct DB allocations, so they only show spent amounts.
         rods.add(BarChartRodData(toY: spent, color: Colors.purple, width: 14, borderRadius: BorderRadius.circular(2)));
-        if (spent > 0) showingTooltipSpots.add(rodIndex);
+        if (spent > 0) showingTooltipSpots.add(0);
       }
 
       barGroups.add(BarChartGroupData(
@@ -399,45 +448,61 @@ class _DashboardScreenState extends State<DashboardScreen> {
         const SizedBox(height: 8),
         Wrap(
           spacing: 8,
-          children: ['Category', 'Subcategory', 'Payment Source'].map((choice) {
+          children: ['Amount', 'Category', 'Subcategory', 'Payment Source'].map((choice) {
             return ChoiceChip(
               label: Text(choice),
               selected: _part2CompareBy == choice,
               onSelected: (val) => setState(() {
                 _part2CompareBy = choice;
                 _part2SelectedFilterId = null;
+                _part2AmountFilter = 'All'; // reset to All
               }),
             );
           }).toList(),
         ),
         const SizedBox(height: 12),
 
-        DropdownButtonFormField<int?>(
-          isExpanded: true,
-          decoration: InputDecoration(labelText: 'Select $_part2CompareBy', isDense: true),
-          value: _part2SelectedFilterId,
-          items: filterOptions.map((o) => DropdownMenuItem<int?>(value: o['id'] as int, child: Text(o['name']))).toList(),
-          onChanged: (val) => setState(() => _part2SelectedFilterId = val),
-        ),
+        // DROPDOWNS
+        if (_part2CompareBy == 'Amount')
+          DropdownButtonFormField<String>(
+            isExpanded: true,
+            decoration: const InputDecoration(labelText: 'Select Detail', isDense: true),
+            value: _part2AmountFilter,
+            items: ['All', 'Budget Allocation', 'Spent Amount'].map((o) => DropdownMenuItem<String>(value: o, child: Text(o))).toList(),
+            onChanged: (val) {
+              if (val != null) setState(() => _part2AmountFilter = val);
+            },
+          )
+        else
+          DropdownButtonFormField<int?>(
+            isExpanded: true,
+            decoration: InputDecoration(labelText: 'Select $_part2CompareBy', isDense: true),
+            value: _part2SelectedFilterId,
+            items: filterOptions.map((o) => DropdownMenuItem<int?>(value: o['id'] as int, child: Text(o['name']))).toList(),
+            onChanged: (val) => setState(() => _part2SelectedFilterId = val),
+          ),
+
         const SizedBox(height: 24),
 
+        // DYNAMIC LEGEND
         Row(
           mainAxisAlignment: MainAxisAlignment.center,
-          children: _part2CompareBy == 'Payment Source'
-              ? [
-            _buildLegend('Spent Amount', Colors.purple),
-          ]
+          children: (_part2CompareBy == 'Payment Source' || _part2CompareBy == 'Subcategory')
+              ? [ _buildLegend('Spent Amount', Colors.purple) ]
               : [
-            _buildLegend('Budget Allocated', Colors.blue),
-            const SizedBox(width: 16),
-            _buildLegend('Actual Spent', Colors.redAccent),
+            if (_part2CompareBy == 'Category' || _part2AmountFilter == 'All' || _part2AmountFilter == 'Budget Allocation')
+              _buildLegend('Budget Allocated', Colors.blue),
+            if (_part2CompareBy == 'Category' || _part2AmountFilter == 'All')
+              const SizedBox(width: 16),
+            if (_part2CompareBy == 'Category' || _part2AmountFilter == 'All' || _part2AmountFilter == 'Spent Amount')
+              _buildLegend('Actual Spent', Colors.redAccent),
           ],
         ),
         const SizedBox(height: 30),
 
         Container(
           height: 320,
-          padding: const EdgeInsets.only(top: 30, right: 16, left: 0, bottom: 8),
+          padding: const EdgeInsets.only(top: 30, right: 16, left: 0, bottom: 20),
           decoration: BoxDecoration(color: Colors.white, borderRadius: BorderRadius.circular(16), border: Border.all(color: Colors.grey.shade200)),
           child: BarChart(
             BarChartData(
@@ -450,7 +515,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
                       tooltipPadding: EdgeInsets.zero,
                       tooltipMargin: 4,
                       getTooltipItem: (group, groupIndex, rod, rodIndex) {
-                        if (rod.toY == 0) return null;
+                        if (rod.toY == 0 || rod.color == Colors.transparent) return null;
                         return BarTooltipItem(
                             rod.toY.toStringAsFixed(0),
                             TextStyle(color: rod.color, fontWeight: FontWeight.bold, fontSize: 10)
@@ -463,13 +528,32 @@ class _DashboardScreenState extends State<DashboardScreen> {
                 bottomTitles: AxisTitles(
                   sideTitles: SideTitles(
                     showTitles: true,
-                    reservedSize: 40,
+                    reservedSize: 55, // Extra space for Name + Days
                     getTitlesWidget: (val, meta) {
                       int idx = val.toInt();
                       if (idx >= 0 && idx < budgets.length) {
                         String name = budgets[idx]['name'];
                         if (name.length > 6) name = '${name.substring(0, 5)}.';
-                        return Padding(padding: const EdgeInsets.only(top: 8.0), child: Text(name, style: const TextStyle(fontSize: 10, fontWeight: FontWeight.bold)));
+
+                        // Add X-Axis Days Calculation
+                        int days = 0;
+                        try {
+                          DateTime sDate = DateTime.parse(budgets[idx]['start_date']);
+                          DateTime eDate = DateTime.parse(budgets[idx]['end_date']);
+                          days = eDate.difference(sDate).inDays + 1;
+                        } catch (_) {}
+
+                        return Padding(
+                            padding: const EdgeInsets.only(top: 8.0),
+                            child: Column(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                Text(name, style: const TextStyle(fontSize: 10, fontWeight: FontWeight.bold)),
+                                if (days > 0)
+                                  Text('($days Days)', style: TextStyle(fontSize: 9, color: Colors.grey.shade600, fontWeight: FontWeight.w600)),
+                              ],
+                            )
+                        );
                       }
                       return const Text('');
                     },
