@@ -2,9 +2,12 @@
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 import 'package:google_fonts/google_fonts.dart';
+import 'package:workmanager/workmanager.dart';
 
 import 'core/database/database_helper.dart';
 import 'core/app_state.dart';
+import 'core/services/background_backup_service.dart';
+
 import 'features/budget/budget_provider.dart';
 import 'features/expenses/expense_provider.dart';
 import 'features/budget/budget_screen.dart';
@@ -14,6 +17,13 @@ import 'features/settings/settings_screen.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
+
+  // Initialize Background Task Manager
+  Workmanager().initialize(
+      callbackDispatcher,
+      isInDebugMode: false
+  );
+
   await DatabaseHelper.instance.database;
 
   runApp(
@@ -71,6 +81,7 @@ class FamilyBudgetApp extends StatelessWidget {
 class MainLayout extends StatelessWidget {
   const MainLayout({super.key});
 
+  // Fixed the list format to prevent compilation errors
   final List<Widget> _screens = const [
     BudgetScreen(),
     ExpensesScreen(),
@@ -89,7 +100,6 @@ class MainLayout extends StatelessWidget {
         child: BottomNavigationBar(
           currentIndex: appState.currentTabIndex,
           onTap: (index) {
-            // FIX: If the user navigates to the Expenses tab (index 1), force a data refresh immediately!
             if (index == 1) {
               Provider.of<ExpenseProvider>(context, listen: false).refreshData();
             }
